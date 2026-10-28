@@ -61,3 +61,11 @@ test("launch request returns a valid Alice greeting without external API keys", 
   assert.match(payload.response.text, /Привет/);
   assert.equal(payload.response.end_session, false);
 });
+
+test("Netlify function adapter handles a GET health check", async () => {
+  const { handler } = await import("../netlify/functions/alice.js");
+  const result = await handler({ httpMethod: "GET" });
+  assert.equal(result.statusCode, 200);
+  assert.equal(JSON.parse(result.body).ok, true);
+  assert.match(result.headers["Content-Type"], /application\/json/);
+});

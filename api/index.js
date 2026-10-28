@@ -1,4 +1,5 @@
 const DEFAULT_MODEL = "gemini-3.5-flash-lite";
+const DEFAULT_GROK_MODEL = "grok-3-mini";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
@@ -172,16 +173,85 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   return answer;
 }
 
+async function askGrok(text, history, searchContext, timeoutMs) {
+  const key = process.env.GROK_API_KEY || process.env.XAI_API_KEY;
+  if (!key) throw new Error("MISSING_GROK_KEY");
+  if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
+
+  const model = String(process.env.GROK_MODEL || DEFAULT_GROK_MODEL).trim();
+  if (!/^[A-Za-z0-9._-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
+
+  const messages = [
+    { role: "system", content: SYSTEM_PROMPT },
+    ...safeHistory(history).map(item => ({ role: item.role, content: item.text }))
+  ];
+  const prompt = searchContext
+    ? `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`
+    : text;
+  messages.push({ role: "user", content: prompt });
+
+  const { response, data } = await fetchJson(
+    "https://api.x.ai/v1/chat/completions",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${key}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ model, messages, temperature: 0.5, max_tokens: 240 })
+    },
+    Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
+  );
+
+  if (!response.ok) {
+    const status = Number(response.status);
+    console.error("Grok request failed with HTTP", status);
+    if (status === 401 || status === 403) throw new Error("GROK_KEY_REJECTED");
+    if (status === 429) throw new Error("GROK_QUOTA");
+    throw new Error("GROK_REQUEST_FAILED");
+  }
+
+  const answer = String(data?.choices?.[0]?.message?.content || "").trim();
+  if (!answer) throw new Error("GROK_EMPTY_RESPONSE");
+  return answer;
+}
+
+async function askModel(text, history, searchContext, timeoutMs) {
+  const provider = String(process.env.AI_PROVIDER || "auto").trim().toLowerCase();
+  if (provider === "grok") return askGrok(text, history, searchContext, timeoutMs);
+  if (provider === "gemini") return askGemini(text, history, searchContext, timeoutMs);
+  if (provider !== "auto") throw new Error("INVALID_AI_PROVIDER");
+
+  if (process.env.GEMINI_API_KEY) return askGemini(text, history, searchContext, timeoutMs);
+  if (process.env.GROK_API_KEY || process.env.XAI_API_KEY) {
+    return askGrok(text, history, searchContext, timeoutMs);
+  }
+  throw new Error("MISSING_AI_KEY");
+}
+
 function errorForUser(error) {
   switch (error?.message) {
     case "MISSING_GEMINI_KEY":
-      return "Сервер пока не настроен. Проверьте переменную GEMINI_API_KEY в настройках Vercel.";
+      return "Сервер пока не настроен. Проверьте переменную GEMINI_API_KEY.";
     case "GEMINI_KEY_REJECTED":
-      return "Не удалось подключиться к Gemini. Проверьте API-ключ в настройках Vercel.";
+      return "Не удалось подключиться к Gemini. Проверьте API-ключ.";
     case "GEMINI_QUOTA":
       return "Сейчас превышен лимит запросов к Gemini. Попробуйте немного позже.";
     case "GEMINI_BLOCKED":
       return "Я не смогла обработать этот запрос. Попробуйте спросить иначе.";
+    case "MISSING_GROK_KEY":
+      return "Сервер пока не настроен. Проверьте переменную GROK_API_KEY или XAI_API_KEY.";
+    case "GROK_KEY_REJECTED":
+      return "Не удалось подключиться к Grok. Проверьте API-ключ xAI.";
+    case "GROK_QUOTA":
+      return "Сейчас превышен лимит запросов к Grok. Попробуйте немного позже.";
+    case "GROK_EMPTY_RESPONSE":
+    case "GROK_REQUEST_FAILED":
+      return "Не получилось получить ответ от Grok. Попробуйте ещё раз чуть позже.";
+    case "MISSING_AI_KEY":
+      return "Сервер пока не настроен. Добавьте GEMINI_API_KEY или GROK_API_KEY.";
+    case "INVALID_AI_PROVIDER":
+      return "В настройках указан неизвестный AI-провайдер. Используйте gemini, grok или auto.";
     case "TIME_BUDGET_EXHAUSTED":
     case "AbortError":
       return "Не успела подготовить ответ. Попробуйте задать вопрос ещё раз, чуть короче.";
@@ -225,7 +295,7 @@ export default async function handler(req, res) {
       searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
     }
 
-    const answer = await askGemini(
+    const answer = await askModel(
       text,
       oldHistory,
       searchContext,
