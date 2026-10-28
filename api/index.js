@@ -1,5 +1,5 @@
 const DEFAULT_MODEL = "gemini-3.5-flash-lite";
-const DEFAULT_GROK_MODEL = "grok-4.6";
+const DEFAULT_GROK_MODEL = "grok-4.7";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
@@ -198,14 +198,21 @@ async function askGrok(text, history, searchContext, timeoutMs) {
         Authorization: `Bearer ${key}`,
         "Content-Type": "application/json"
       },
-      body: JSON.stringify({ model, messages, temperature: 0.5, max_tokens: 240 })
+      body: JSON.stringify({
+        model,
+        messages,
+        temperature: 0.7,
+        reasoning_effort: "low",
+        max_tokens: 240
+      })
     },
     Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
   );
 
   if (!response.ok) {
     const status = Number(response.status);
-    console.error("Grok request failed with HTTP", status);
+    const providerError = data?.error?.message || data?.error || "unknown error";
+    console.error("Grok request failed with HTTP", status, String(providerError).slice(0, 500));
     if (status === 401 || status === 403) throw new Error("GROK_KEY_REJECTED");
     if (status === 429) throw new Error("GROK_QUOTA");
     throw new Error("GROK_REQUEST_FAILED");
