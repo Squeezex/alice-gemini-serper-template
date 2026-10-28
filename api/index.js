@@ -3,9 +3,9 @@ const DEFAULT_GROK_MODEL = "grok-4.7";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 3600;
-const SERPER_TIMEOUT_MS = 600;
-const GEMINI_TIMEOUT_MS = 2500;
+const TOTAL_RESPONSE_BUDGET_MS = 4200;
+const SERPER_TIMEOUT_MS = 800;
+const GEMINI_TIMEOUT_MS = 3200;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -300,14 +300,17 @@ export default async function handler(req, res) {
     let searchContext = "";
     if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
       // Search has a very short budget because Alice expects a response within 4.5 seconds.
-      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
+      searchContext = await searchWeb(
+        text,
+        Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - GEMINI_TIMEOUT_MS - 200))
+      );
     }
 
     const answer = await askModel(
       text,
       oldHistory,
       searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600))
+      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 200))
     );
 
     const history = [
