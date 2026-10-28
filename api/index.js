@@ -232,16 +232,25 @@ async function askModel(text, history, searchContext, timeoutMs) {
   if (provider === "gemini") return askGemini(text, history, searchContext, timeoutMs);
   if (provider !== "auto") throw new Error("INVALID_AI_PROVIDER");
 
-  if (process.env.GEMINI_API_KEY) return askGemini(text, history, searchContext, timeoutMs);
+  const requests = [];
+  if (process.env.GEMINI_API_KEY) requests.push(askGemini(text, history, searchContext, timeoutMs));
   if (process.env.GROK_API_KEY || process.env.XAI_API_KEY) {
-    return askGrok(text, history, searchContext, timeoutMs);
+    requests.push(askGrok(text, history, searchContext, timeoutMs));
+  }
+  if (requests.length === 1) return requests[0];
+  if (requests.length > 1) {
+    try {
+      return await Promise.any(requests);
+    } catch (error) {
+      throw error?.errors?.[0] || error;
+    }
   }
   throw new Error("MISSING_AI_KEY");
 }
 
 async function askModelWithFallback(text, history, searchContext, timeoutMs, getRemainingMs = () => timeoutMs) {
   const provider = String(process.env.AI_PROVIDER || "auto").trim().toLowerCase();
-  const geminiIsPrimary = provider === "gemini" || (provider === "auto" && process.env.GEMINI_API_KEY);
+  const geminiIsPrimary = provider === "gemini";
   const grokKey = process.env.GROK_API_KEY || process.env.XAI_API_KEY;
 
   try {
@@ -328,7 +337,11 @@ export default async function handler(req, res) {
     const provider = String(process.env.AI_PROVIDER || "auto").trim().toLowerCase();
     const geminiIsPrimary = provider === "gemini" || (provider === "auto" && process.env.GEMINI_API_KEY);
     const hasGrokFallback = geminiIsPrimary && (process.env.GROK_API_KEY || process.env.XAI_API_KEY);
-    const primaryTimeout = hasGrokFallback ? PRIMARY_AI_TIMEOUT_MS : GEMINI_TIMEOUT_MS;
+    const parallelProviders = provider === "auto" && process.env.GEMINI_API_KEY &&
+      (process.env.GROK_API_KEY || process.env.XAI_API_KEY);
+    const primaryTimeout = parallelProviders
+      ? GEMINI_TIMEOUT_MS
+      : (hasGrokFallback ? PRIMARY_AI_TIMEOUT_MS : GEMINI_TIMEOUT_MS);
     if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
       // Search has a very short budget because Alice expects a response within 4.5 seconds.
       searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - primaryTimeout - 200)));
