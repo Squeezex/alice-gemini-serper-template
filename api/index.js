@@ -237,6 +237,27 @@ async function askModel(text, history, searchContext, timeoutMs) {
   throw new Error("MISSING_AI_KEY");
 }
 
+async function askModelWithFallback(text, history, searchContext, timeoutMs, getRemainingMs = () => timeoutMs) {
+  const provider = String(process.env.AI_PROVIDER || "auto").trim().toLowerCase();
+  const geminiIsPrimary = provider === "gemini" || (provider === "auto" && process.env.GEMINI_API_KEY);
+  const grokKey = process.env.GROK_API_KEY || process.env.XAI_API_KEY;
+
+  try {
+    return await askModel(text, history, searchContext, timeoutMs);
+  } catch (primaryError) {
+    const fallbackTimeout = Math.min(GEMINI_TIMEOUT_MS, timeoutMs - 150, getRemainingMs() - 150);
+    if (!geminiIsPrimary || !grokKey || fallbackTimeout < 300) throw primaryError;
+
+    console.warn("Gemini failed; trying Grok fallback:", primaryError?.message || "unknown error");
+    return askGrok(text, history, searchContext, fallbackTimeout);
+  }
+}
+
+function searchFallback(searchContext) {
+  if (!searchContext) return "";
+  return fitAliceText(`Нейросети временно недоступны. Вот что удалось найти: ${searchContext}`);
+}
+
 function errorForUser(error) {
   switch (error?.message) {
     case "MISSING_GEMINI_KEY":
@@ -306,12 +327,22 @@ export default async function handler(req, res) {
       );
     }
 
-    const answer = await askModel(
-      text,
-      oldHistory,
-      searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 200))
-    );
+    let answer;
+    try {
+      answer = await askModelWithFallback(
+        text,
+        oldHistory,
+        searchContext,
+        Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 200)),
+        remainingMs
+      );
+    } catch (error) {
+      const directSearchAnswer = searchFallback(searchContext);
+      if (directSearchAnswer) {
+        return res.status(200).json(aliceResponse(directSearchAnswer, false, oldHistory));
+      }
+      throw error;
+    }
 
     const history = [
       ...oldHistory,
