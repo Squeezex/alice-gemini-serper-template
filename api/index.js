@@ -4,8 +4,10 @@ const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 4400;
-const SERPER_TIMEOUT_MS = 800;
+const SERPER_TIMEOUT_MS = 400;
 const GEMINI_TIMEOUT_MS = 3900;
+const PRIMARY_AI_TIMEOUT_MS = 2200;
+const GROK_FALLBACK_TIMEOUT_MS = 1800;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -245,7 +247,11 @@ async function askModelWithFallback(text, history, searchContext, timeoutMs, get
   try {
     return await askModel(text, history, searchContext, timeoutMs);
   } catch (primaryError) {
-    const fallbackTimeout = Math.min(GEMINI_TIMEOUT_MS, timeoutMs - 150, getRemainingMs() - 150);
+    const fallbackTimeout = Math.min(
+      GROK_FALLBACK_TIMEOUT_MS,
+      timeoutMs - 150,
+      getRemainingMs() - 150
+    );
     if (!geminiIsPrimary || !grokKey || fallbackTimeout < 300) throw primaryError;
 
     console.warn("Gemini failed; trying Grok fallback:", primaryError?.message || "unknown error");
@@ -319,12 +325,13 @@ export default async function handler(req, res) {
 
   try {
     let searchContext = "";
+    const provider = String(process.env.AI_PROVIDER || "auto").trim().toLowerCase();
+    const geminiIsPrimary = provider === "gemini" || (provider === "auto" && process.env.GEMINI_API_KEY);
+    const hasGrokFallback = geminiIsPrimary && (process.env.GROK_API_KEY || process.env.XAI_API_KEY);
+    const primaryTimeout = hasGrokFallback ? PRIMARY_AI_TIMEOUT_MS : GEMINI_TIMEOUT_MS;
     if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
       // Search has a very short budget because Alice expects a response within 4.5 seconds.
-      searchContext = await searchWeb(
-        text,
-        Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - GEMINI_TIMEOUT_MS - 200))
-      );
+      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - primaryTimeout - 200)));
     }
 
     let answer;
@@ -333,7 +340,7 @@ export default async function handler(req, res) {
         text,
         oldHistory,
         searchContext,
-        Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 200)),
+        Math.max(0, Math.min(primaryTimeout, remainingMs() - 200)),
         remainingMs
       );
     } catch (error) {
