@@ -3,9 +3,9 @@ const DEFAULT_GROK_MODEL = "grok-4.7";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 4200;
+const TOTAL_RESPONSE_BUDGET_MS = 4400;
 const SERPER_TIMEOUT_MS = 800;
-const GEMINI_TIMEOUT_MS = 3200;
+const GEMINI_TIMEOUT_MS = 3900;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
