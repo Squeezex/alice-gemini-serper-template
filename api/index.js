@@ -326,7 +326,7 @@ export default async function handler(req, res) {
 
   if (!text) {
     return res.status(200).json(aliceResponse(
-      "Привет! Я могу ответить на вопрос или найти актуальную информацию. Что хочешь узнать?",
+      "Джарвис ты что за имба. Что узнать?",
       false,
       oldHistory
     ));
