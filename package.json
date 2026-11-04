@@ -10,5 +10,8 @@
   "scripts": {
     "start": "node server.js",
     "test": "node --test"
+  },
+  "dependencies": {
+    "undici": "^7.16.0"
   }
 }

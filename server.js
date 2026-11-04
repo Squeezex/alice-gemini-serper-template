@@ -2,7 +2,7 @@ import http from "node:http";
 import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import handler from "./api/index.js";
+import handler, { warmupGemini } from "./api/index.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 80);
@@ -128,4 +128,8 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, HOST, () => {
   console.log(`Alice webhook listening on http://${HOST}:${PORT}`);
   console.log(`Webhook URL path: /api`);
+  // Warm TLS to Google before the first Alice request (critical on Amvera).
+  warmupGemini().catch(error => {
+    console.warn("Gemini warmup ignored error:", error?.message || error);
+  });
 });

@@ -1,23 +1,31 @@
+import { Agent } from "undici";
+
 // New Gemini keys often cannot use 2.5 models — prefer 3.5 Flash-Lite with minimal thinking.
 const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 const DEFAULT_GROK_MODEL = "grok-4.7";
-const MAX_HISTORY_MESSAGES = 8;
-const MAX_HISTORY_MESSAGE_CHARS = 1200;
+const MAX_HISTORY_MESSAGES = 4;
+const MAX_HISTORY_MESSAGE_CHARS = 500;
 const MAX_ALICE_TEXT = 1024;
-// Leave headroom for Alice ↔ Amvera network; Dialogs cut off at ~4500ms total.
-const TOTAL_RESPONSE_BUDGET_MS = 3600;
-const SERPER_TIMEOUT_MS = 300;
-const GEMINI_TIMEOUT_MS = 3100;
-const PRIMARY_AI_TIMEOUT_MS = 1800;
+// Alice cuts at ~4500ms total (incl. network). Keep a small margin.
+const TOTAL_RESPONSE_BUDGET_MS = Number(process.env.TOTAL_RESPONSE_BUDGET_MS) || 4000;
+const SERPER_TIMEOUT_MS = 250;
+const GEMINI_TIMEOUT_MS = Number(process.env.GEMINI_TIMEOUT_MS) || 3800;
+const PRIMARY_AI_TIMEOUT_MS = 2000;
 const GROK_FALLBACK_TIMEOUT_MS = 1400;
 
 const SYSTEM_PROMPT = [
-  "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
-  "Отвечай естественно, по-русски, кратко и так, чтобы ответ было удобно слушать.",
-  "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления.",
-  "Если вопрос требует актуальных данных и переданы результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
-  "Если не знаешь ответа, честно скажи об этом."
+  "Голосовой помощник Яндекс Алисы.",
+  "Отвечай по-русски, коротко: 1–2 предложения, без Markdown и списков.",
+  "Не выдумывай факты. Если не знаешь — скажи прямо."
 ].join(" ");
+
+// Reuse TLS connections to Google — cold handshake from Amvera often costs 0.5–1.5s.
+const geminiAgent = new Agent({
+  connections: 4,
+  keepAliveTimeout: 60_000,
+  keepAliveMaxTimeout: 60_000,
+  connect: { timeout: 2_500 }
+});
 
 function aliceResponse(text, endSession = false, history = []) {
   return {
@@ -68,11 +76,15 @@ function isAbortError(error) {
     || /aborted/i.test(String(error?.message || ""));
 }
 
-async function fetchJson(url, options, timeoutMs) {
+async function fetchJson(url, options, timeoutMs, useGeminiAgent = false) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), Math.max(100, timeoutMs));
   try {
-    const response = await fetch(url, { ...options, signal: controller.signal });
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+      ...(useGeminiAgent ? { dispatcher: geminiAgent } : {})
+    });
     const data = await response.json().catch(() => ({}));
     return { response, data };
   } catch (error) {
@@ -140,21 +152,10 @@ function geminiThinkingConfig(model) {
   return { thinkingLevel: "minimal" };
 }
 
-function resolveGeminiModels() {
-  const preferred = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
-  const fallbacks = [
-    preferred,
-    "gemini-3.5-flash-lite",
-    "gemini-3.1-flash-lite",
-    "gemini-2.5-flash-lite"
-  ];
-  const unique = [];
-  for (const model of fallbacks) {
-    if (!model || !/^[A-Za-z0-9._-]+$/.test(model)) continue;
-    if (!unique.includes(model)) unique.push(model);
-  }
-  if (!unique.length) throw new Error("INVALID_MODEL_NAME");
-  return unique;
+function resolveGeminiModel() {
+  const model = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
+  if (!/^[A-Za-z0-9._-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
+  return model;
 }
 
 function extractGeminiText(data) {
@@ -168,133 +169,142 @@ function extractGeminiText(data) {
   return { candidate, answer };
 }
 
+function buildGeminiBody(model, contents, withThinking) {
+  // maxOutputTokens includes thought tokens on Gemini 3.x.
+  return JSON.stringify({
+    systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+    contents,
+    generationConfig: {
+      temperature: 0.3,
+      maxOutputTokens: 192,
+      ...(withThinking ? { thinkingConfig: geminiThinkingConfig(model) } : {})
+    }
+  });
+}
+
 async function askGemini(text, history, searchContext, timeoutMs) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error("MISSING_GEMINI_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
 
-  const models = resolveGeminiModels();
+  const model = resolveGeminiModel();
   const contents = safeHistory(history).map(item => ({
     role: item.role,
     parts: [{ text: item.text }]
   }));
 
   const prompt = searchContext
-    ? `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`
+    ? `${text}\n\nРезультаты поиска:\n${searchContext}\nОпирайся только на них, если относятся к вопросу.`
     : text;
   contents.push({ role: "user", parts: [{ text: prompt }] });
 
   const started = Date.now();
   const budget = Math.min(GEMINI_TIMEOUT_MS, timeoutMs);
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
   const headers = {
     "Content-Type": "application/json",
     "x-goog-api-key": key
   };
 
-  // maxOutputTokens includes thought tokens on Gemini 3.x — keep headroom for the spoken answer.
-  const buildBody = (model, withThinking) => JSON.stringify({
-    systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-    contents,
-    generationConfig: {
-      temperature: 0.4,
-      maxOutputTokens: 512,
-      ...(withThinking ? { thinkingConfig: geminiThinkingConfig(model) } : {})
+  try {
+    let { response, data } = await fetchJson(
+      endpoint,
+      { method: "POST", headers, body: buildGeminiBody(model, contents, true) },
+      budget,
+      true
+    );
+
+    // Only retry thinkingConfig on fast 400 — do not burn the Alice budget on slow failures.
+    if (!response.ok && Number(response.status) === 400) {
+      const msg = String(data?.error?.message || "").toLowerCase();
+      const left = budget - (Date.now() - started);
+      if (left >= 400 && (msg.includes("thinking") || msg.includes("invalid"))) {
+        console.warn(`Gemini ${model} rejected thinkingConfig; one quick retry without it`);
+        ({ response, data } = await fetchJson(
+          endpoint,
+          { method: "POST", headers, body: buildGeminiBody(model, contents, false) },
+          left,
+          true
+        ));
+      }
     }
-  });
 
-  let lastError = "GEMINI_REQUEST_FAILED";
+    console.log(`Gemini ${model} finished in ${Date.now() - started}ms, http=${response.status}`);
 
-  for (let i = 0; i < models.length; i++) {
-    const model = models[i];
-    const left = budget - (Date.now() - started);
-    if (left < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
+    if (!response.ok) {
+      const status = Number(response.status);
+      const providerError = data?.error?.message || data?.error || "unknown error";
+      console.error("Gemini request failed with HTTP", status, String(providerError).slice(0, 500));
+      if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
+      if (status === 429) throw new Error("GEMINI_QUOTA");
+      if (status === 404) throw new Error("GEMINI_MODEL_UNAVAILABLE");
+      throw new Error("GEMINI_REQUEST_FAILED");
+    }
 
-    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
-
-    try {
-      let { response, data } = await fetchJson(
-        endpoint,
-        { method: "POST", headers, body: buildBody(model, true) },
-        left
+    const { candidate, answer } = extractGeminiText(data);
+    if (!answer) {
+      if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
+      console.warn(
+        "Gemini empty text. finishReason=",
+        candidate?.finishReason,
+        "parts=",
+        JSON.stringify(candidate?.content?.parts || []).slice(0, 300)
       );
-
-      if (!response.ok && Number(response.status) === 400) {
-        const msg = String(data?.error?.message || "").toLowerCase();
-        const retryLeft = budget - (Date.now() - started);
-        if (retryLeft >= 250 && (msg.includes("thinking") || msg.includes("invalid"))) {
-          console.warn(`Gemini ${model} rejected thinkingConfig; retrying without it`);
-          ({ response, data } = await fetchJson(
-            endpoint,
-            { method: "POST", headers, body: buildBody(model, false) },
-            retryLeft
-          ));
-        }
-      }
-
-      console.log(`Gemini ${model} finished in ${Date.now() - started}ms, http=${response.status}`);
-
-      if (!response.ok) {
-        const status = Number(response.status);
-        const providerError = data?.error?.message || data?.error || "unknown error";
-        console.error("Gemini request failed with HTTP", status, String(providerError).slice(0, 500));
-        if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
-        if (status === 429) throw new Error("GEMINI_QUOTA");
-        if (status === 404) {
-          lastError = "GEMINI_MODEL_UNAVAILABLE";
-          console.warn(`Gemini model unavailable: ${model}`);
-          continue;
-        }
-        lastError = "GEMINI_REQUEST_FAILED";
-        if (i < models.length - 1) continue;
-        throw new Error(lastError);
-      }
-
-      const { candidate, answer } = extractGeminiText(data);
-      if (!answer) {
-        if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
-        console.warn(
-          "Gemini empty text. finishReason=",
-          candidate?.finishReason,
-          "parts=",
-          JSON.stringify(candidate?.content?.parts || []).slice(0, 300)
-        );
-        lastError = "GEMINI_EMPTY_RESPONSE";
-        if (i < models.length - 1) continue;
-        throw new Error(lastError);
-      }
-      if (candidate?.finishReason === "MAX_TOKENS") {
-        console.warn("Gemini reached the output token limit.");
-      }
-      return answer;
-    } catch (error) {
-      if (
-        error?.message === "MISSING_GEMINI_KEY"
-        || error?.message === "GEMINI_KEY_REJECTED"
-        || error?.message === "GEMINI_QUOTA"
-        || error?.message === "GEMINI_BLOCKED"
-        || error?.message === "TIME_BUDGET_EXHAUSTED"
-        || error?.message === "AbortError"
-      ) {
-        throw error;
-      }
-      if (error?.message === "NETWORK_ERROR") {
-        console.error("Gemini network error:", error?.cause?.message || error);
-        throw new Error("GEMINI_NETWORK");
-      }
-      if (
-        error?.message === "GEMINI_MODEL_UNAVAILABLE"
-        || error?.message === "GEMINI_EMPTY_RESPONSE"
-        || error?.message === "GEMINI_REQUEST_FAILED"
-      ) {
-        lastError = error.message;
-        if (i < models.length - 1) continue;
-        throw error;
-      }
-      throw error;
+      throw new Error("GEMINI_EMPTY_RESPONSE");
     }
+    if (candidate?.finishReason === "MAX_TOKENS") {
+      console.warn("Gemini reached the output token limit.");
+    }
+    return answer;
+  } catch (error) {
+    if (error?.message === "NETWORK_ERROR") {
+      console.error("Gemini network error:", error?.cause?.message || error);
+      throw new Error("GEMINI_NETWORK");
+    }
+    throw error;
+  }
+}
+
+/** Open TLS to Google ahead of Alice traffic (Amvera keeps the process warm). */
+export async function warmupGemini() {
+  const key = process.env.GEMINI_API_KEY;
+  if (!key) {
+    console.warn("Gemini warmup skipped: GEMINI_API_KEY is not set");
+    return { ok: false, reason: "missing_key" };
   }
 
-  throw new Error(lastError);
+  const model = resolveGeminiModel();
+  const started = Date.now();
+  try {
+    const { response, data } = await fetchJson(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": key
+        },
+        body: buildGeminiBody(
+          model,
+          [{ role: "user", parts: [{ text: "ок" }] }],
+          true
+        )
+      },
+      8_000,
+      true
+    );
+    const ms = Date.now() - started;
+    const { answer } = extractGeminiText(data);
+    console.log(`Gemini warmup ${response.status} in ${ms}ms model=${model} answer=${Boolean(answer)}`);
+    if (!response.ok) {
+      console.error("Gemini warmup error:", String(data?.error?.message || "").slice(0, 300));
+      return { ok: false, status: response.status, ms };
+    }
+    return { ok: true, ms, model };
+  } catch (error) {
+    console.error(`Gemini warmup failed in ${Date.now() - started}ms:`, error?.message || error);
+    return { ok: false, reason: error?.message || "error" };
+  }
 }
 
 async function askGrok(text, history, searchContext, timeoutMs) {

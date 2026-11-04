@@ -4,9 +4,6 @@ meta:
     name: npm
     version: "22"
 
-build:
-  skip: yes
-
 run:
   scriptName: server.js
   containerPort: 80

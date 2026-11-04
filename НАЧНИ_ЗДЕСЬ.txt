@@ -8,6 +8,8 @@
    GEMINI_MODEL — gemini-3.5-flash-lite
    SERPER_API_KEY — по желанию (поиск в интернете)
 4. Перезапустите приложение после сохранения переменных.
+   В логах должна появиться строка Gemini warmup ... in ...ms — значит связь с Google жива.
+   Если warmup failed / network — регион Amvera не достучался до Gemini.
 5. Во вкладке «Домены» добавьте бесплатный HTTPS-домен Amvera.
 6. Скопируйте адрес вида https://ВАШ-ДОМЕН.amvera.tech/api
 7. В Яндекс Диалогах вставьте этот адрес в Webhook URL навыка.
