@@ -1,13 +1,15 @@
-const DEFAULT_MODEL = "gemini-3.5-flash-lite";
+// 2.5 Flash-Lite: fast, thinking off by default. Gemini 3.x thinking often exceeds Alice's 4.5s.
+const DEFAULT_MODEL = "gemini-2.5-flash-lite";
 const DEFAULT_GROK_MODEL = "grok-4.7";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 4400;
-const SERPER_TIMEOUT_MS = 400;
-const GEMINI_TIMEOUT_MS = 3900;
-const PRIMARY_AI_TIMEOUT_MS = 2200;
-const GROK_FALLBACK_TIMEOUT_MS = 1800;
+// Leave headroom for Alice ↔ Amvera network; Dialogs cut off at ~4500ms total.
+const TOTAL_RESPONSE_BUDGET_MS = 3500;
+const SERPER_TIMEOUT_MS = 300;
+const GEMINI_TIMEOUT_MS = 3000;
+const PRIMARY_AI_TIMEOUT_MS = 1800;
+const GROK_FALLBACK_TIMEOUT_MS = 1400;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -113,6 +115,22 @@ async function searchWeb(query, timeoutMs) {
   }
 }
 
+function geminiThinkingConfig(model) {
+  const name = String(model || "").toLowerCase();
+  // Gemini 2.5: disable thinking for voice latency.
+  if (name.includes("2.5") || name.includes("2.0") || name.includes("1.5")) {
+    return { thinkingBudget: 0 };
+  }
+  // Gemini 3+/4: thinking can't be fully off; keep it minimal/low.
+  if (name.includes("flash-lite") || name.includes("flash_lite")) {
+    return { thinkingLevel: "minimal" };
+  }
+  if (name.includes("flash") || name.includes("lite")) {
+    return { thinkingLevel: "minimal" };
+  }
+  return { thinkingLevel: "low" };
+}
+
 async function askGemini(text, history, searchContext, timeoutMs) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error("MISSING_GEMINI_KEY");
@@ -131,25 +149,47 @@ async function askGemini(text, history, searchContext, timeoutMs) {
     : text;
   contents.push({ role: "user", parts: [{ text: prompt }] });
 
-  const { response, data } = await fetchJson(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": key
-      },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-        contents,
-        generationConfig: {
-          temperature: 0.5,
-          maxOutputTokens: 240
-        }
-      })
-    },
-    Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
+  const started = Date.now();
+  const budget = Math.min(GEMINI_TIMEOUT_MS, timeoutMs);
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+  const headers = {
+    "Content-Type": "application/json",
+    "x-goog-api-key": key
+  };
+
+  const buildBody = (withThinking) => JSON.stringify({
+    systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+    contents,
+    generationConfig: {
+      temperature: 0.5,
+      maxOutputTokens: 160,
+      ...(withThinking ? { thinkingConfig: geminiThinkingConfig(model) } : {})
+    }
+  });
+
+  let { response, data } = await fetchJson(
+    endpoint,
+    { method: "POST", headers, body: buildBody(true) },
+    budget
   );
+
+  // Some model/API combinations reject thinkingConfig — retry once without it.
+  if (!response.ok && Number(response.status) === 400) {
+    const msg = String(data?.error?.message || "").toLowerCase();
+    if (msg.includes("thinking") || msg.includes("invalid")) {
+      const left = budget - (Date.now() - started);
+      if (left >= 250) {
+        console.warn("Gemini rejected thinkingConfig; retrying without it");
+        ({ response, data } = await fetchJson(
+          endpoint,
+          { method: "POST", headers, body: buildBody(false) },
+          left
+        ));
+      }
+    }
+  }
+
+  console.log(`Gemini ${model} finished in ${Date.now() - started}ms, http=${response.status}`);
 
   if (!response.ok) {
     const status = Number(response.status);
@@ -162,6 +202,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
 
   const candidate = data?.candidates?.[0];
   const answer = (candidate?.content?.parts || [])
+    .filter(part => !part?.thought)
     .map(part => typeof part.text === "string" ? part.text : "")
     .join("")
     .trim();
@@ -370,10 +411,14 @@ export default async function handler(req, res) {
       { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
     ].slice(-MAX_HISTORY_MESSAGES);
 
+    console.log(`Alice webhook ok in ${Date.now() - startedAt}ms`);
     return res.status(200).json(aliceResponse(answer, false, history));
   } catch (error) {
     const safeError = error?.message === "AbortError" ? "TIME_BUDGET_EXHAUSTED" : error;
-    console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
+    console.warn(
+      `Alice webhook fallback in ${Date.now() - startedAt}ms:`,
+      safeError?.message || "unknown error"
+    );
     return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory));
   }
 }
