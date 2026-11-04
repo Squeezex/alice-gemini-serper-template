@@ -5,7 +5,7 @@
 3. Во вкладке «Переменные» добавьте секреты:
    GEMINI_API_KEY — ключ из https://aistudio.google.com/app/apikey
    AI_PROVIDER — gemini
-   GEMINI_MODEL — gemini-2.5-flash-lite  (не ставьте gemini-3.x — не успеет за 4.5 с)
+   GEMINI_MODEL — gemini-3.5-flash-lite
    SERPER_API_KEY — по желанию (поиск в интернете)
 4. Перезапустите приложение после сохранения переменных.
 5. Во вкладке «Домены» добавьте бесплатный HTTPS-домен Amvera.

@@ -29,7 +29,7 @@
 
 - **GEMINI_API_KEY** — обязателен для ответов нейросети.
 - **SERPER_API_KEY** — включает поиск. Без него обычные ответы Gemini работают, поиск недоступен.
-- **GEMINI_MODEL** — необязателен. По умолчанию `gemini-2.5-flash-lite` (быстрая, без thinking). Для Алисы на Amvera **не ставьте** `gemini-3.5-*` / Pro: thinking часто не укладывается в 4.5 с.
+- **GEMINI_MODEL** — необязателен. По умолчанию `gemini-3.5-flash-lite` (новые ключи часто не открывают 2.5). В коде thinking = `minimal`, чтобы уложиться в 4.5 с Алисы.
 - **AI_PROVIDER** — `gemini` (рекомендуется), `auto` или `grok`.
 - **GROK_API_KEY** / **XAI_API_KEY** — только если нужен Grok.
 

@@ -1,13 +1,13 @@
-// 2.5 Flash-Lite: fast, thinking off by default. Gemini 3.x thinking often exceeds Alice's 4.5s.
-const DEFAULT_MODEL = "gemini-2.5-flash-lite";
+// New Gemini keys often cannot use 2.5 models — prefer 3.5 Flash-Lite with minimal thinking.
+const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 const DEFAULT_GROK_MODEL = "grok-4.7";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 // Leave headroom for Alice ↔ Amvera network; Dialogs cut off at ~4500ms total.
-const TOTAL_RESPONSE_BUDGET_MS = 3500;
+const TOTAL_RESPONSE_BUDGET_MS = 3600;
 const SERPER_TIMEOUT_MS = 300;
-const GEMINI_TIMEOUT_MS = 3000;
+const GEMINI_TIMEOUT_MS = 3100;
 const PRIMARY_AI_TIMEOUT_MS = 1800;
 const GROK_FALLBACK_TIMEOUT_MS = 1400;
 
@@ -62,6 +62,12 @@ function safeHistory(history) {
     .map(item => ({ role: item.role, text: item.text.slice(0, MAX_HISTORY_MESSAGE_CHARS) }));
 }
 
+function isAbortError(error) {
+  return error?.name === "AbortError"
+    || error?.message === "AbortError"
+    || /aborted/i.test(String(error?.message || ""));
+}
+
 async function fetchJson(url, options, timeoutMs) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), Math.max(100, timeoutMs));
@@ -69,6 +75,15 @@ async function fetchJson(url, options, timeoutMs) {
     const response = await fetch(url, { ...options, signal: controller.signal });
     const data = await response.json().catch(() => ({}));
     return { response, data };
+  } catch (error) {
+    if (isAbortError(error)) {
+      const abortError = new Error("AbortError");
+      abortError.name = "AbortError";
+      throw abortError;
+    }
+    const networkError = new Error("NETWORK_ERROR");
+    networkError.cause = error;
+    throw networkError;
   } finally {
     clearTimeout(timer);
   }
@@ -117,18 +132,40 @@ async function searchWeb(query, timeoutMs) {
 
 function geminiThinkingConfig(model) {
   const name = String(model || "").toLowerCase();
-  // Gemini 2.5: disable thinking for voice latency.
-  if (name.includes("2.5") || name.includes("2.0") || name.includes("1.5")) {
+  // Gemini 2.5 / older: thinkingBudget=0 turns thinking off.
+  if (/\b(2\.5|2\.0|1\.5)\b/.test(name)) {
     return { thinkingBudget: 0 };
   }
-  // Gemini 3+/4: thinking can't be fully off; keep it minimal/low.
-  if (name.includes("flash-lite") || name.includes("flash_lite")) {
-    return { thinkingLevel: "minimal" };
+  // Gemini 3+/4: cannot fully disable; minimal keeps Alice under 4.5s.
+  return { thinkingLevel: "minimal" };
+}
+
+function resolveGeminiModels() {
+  const preferred = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
+  const fallbacks = [
+    preferred,
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash-lite"
+  ];
+  const unique = [];
+  for (const model of fallbacks) {
+    if (!model || !/^[A-Za-z0-9._-]+$/.test(model)) continue;
+    if (!unique.includes(model)) unique.push(model);
   }
-  if (name.includes("flash") || name.includes("lite")) {
-    return { thinkingLevel: "minimal" };
-  }
-  return { thinkingLevel: "low" };
+  if (!unique.length) throw new Error("INVALID_MODEL_NAME");
+  return unique;
+}
+
+function extractGeminiText(data) {
+  const candidate = data?.candidates?.[0];
+  const parts = candidate?.content?.parts || [];
+  const answer = parts
+    .filter(part => !part?.thought)
+    .map(part => typeof part.text === "string" ? part.text : "")
+    .join("")
+    .trim();
+  return { candidate, answer };
 }
 
 async function askGemini(text, history, searchContext, timeoutMs) {
@@ -136,9 +173,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   if (!key) throw new Error("MISSING_GEMINI_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
 
-  const model = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
-  if (!/^[A-Za-z0-9._-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
-
+  const models = resolveGeminiModels();
   const contents = safeHistory(history).map(item => ({
     role: item.role,
     parts: [{ text: item.text }]
@@ -151,70 +186,115 @@ async function askGemini(text, history, searchContext, timeoutMs) {
 
   const started = Date.now();
   const budget = Math.min(GEMINI_TIMEOUT_MS, timeoutMs);
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
   const headers = {
     "Content-Type": "application/json",
     "x-goog-api-key": key
   };
 
-  const buildBody = (withThinking) => JSON.stringify({
+  // maxOutputTokens includes thought tokens on Gemini 3.x — keep headroom for the spoken answer.
+  const buildBody = (model, withThinking) => JSON.stringify({
     systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
     contents,
     generationConfig: {
-      temperature: 0.5,
-      maxOutputTokens: 160,
+      temperature: 0.4,
+      maxOutputTokens: 512,
       ...(withThinking ? { thinkingConfig: geminiThinkingConfig(model) } : {})
     }
   });
 
-  let { response, data } = await fetchJson(
-    endpoint,
-    { method: "POST", headers, body: buildBody(true) },
-    budget
-  );
+  let lastError = "GEMINI_REQUEST_FAILED";
 
-  // Some model/API combinations reject thinkingConfig — retry once without it.
-  if (!response.ok && Number(response.status) === 400) {
-    const msg = String(data?.error?.message || "").toLowerCase();
-    if (msg.includes("thinking") || msg.includes("invalid")) {
-      const left = budget - (Date.now() - started);
-      if (left >= 250) {
-        console.warn("Gemini rejected thinkingConfig; retrying without it");
-        ({ response, data } = await fetchJson(
-          endpoint,
-          { method: "POST", headers, body: buildBody(false) },
-          left
-        ));
+  for (let i = 0; i < models.length; i++) {
+    const model = models[i];
+    const left = budget - (Date.now() - started);
+    if (left < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
+
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+
+    try {
+      let { response, data } = await fetchJson(
+        endpoint,
+        { method: "POST", headers, body: buildBody(model, true) },
+        left
+      );
+
+      if (!response.ok && Number(response.status) === 400) {
+        const msg = String(data?.error?.message || "").toLowerCase();
+        const retryLeft = budget - (Date.now() - started);
+        if (retryLeft >= 250 && (msg.includes("thinking") || msg.includes("invalid"))) {
+          console.warn(`Gemini ${model} rejected thinkingConfig; retrying without it`);
+          ({ response, data } = await fetchJson(
+            endpoint,
+            { method: "POST", headers, body: buildBody(model, false) },
+            retryLeft
+          ));
+        }
       }
+
+      console.log(`Gemini ${model} finished in ${Date.now() - started}ms, http=${response.status}`);
+
+      if (!response.ok) {
+        const status = Number(response.status);
+        const providerError = data?.error?.message || data?.error || "unknown error";
+        console.error("Gemini request failed with HTTP", status, String(providerError).slice(0, 500));
+        if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
+        if (status === 429) throw new Error("GEMINI_QUOTA");
+        if (status === 404) {
+          lastError = "GEMINI_MODEL_UNAVAILABLE";
+          console.warn(`Gemini model unavailable: ${model}`);
+          continue;
+        }
+        lastError = "GEMINI_REQUEST_FAILED";
+        if (i < models.length - 1) continue;
+        throw new Error(lastError);
+      }
+
+      const { candidate, answer } = extractGeminiText(data);
+      if (!answer) {
+        if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
+        console.warn(
+          "Gemini empty text. finishReason=",
+          candidate?.finishReason,
+          "parts=",
+          JSON.stringify(candidate?.content?.parts || []).slice(0, 300)
+        );
+        lastError = "GEMINI_EMPTY_RESPONSE";
+        if (i < models.length - 1) continue;
+        throw new Error(lastError);
+      }
+      if (candidate?.finishReason === "MAX_TOKENS") {
+        console.warn("Gemini reached the output token limit.");
+      }
+      return answer;
+    } catch (error) {
+      if (
+        error?.message === "MISSING_GEMINI_KEY"
+        || error?.message === "GEMINI_KEY_REJECTED"
+        || error?.message === "GEMINI_QUOTA"
+        || error?.message === "GEMINI_BLOCKED"
+        || error?.message === "TIME_BUDGET_EXHAUSTED"
+        || error?.message === "AbortError"
+      ) {
+        throw error;
+      }
+      if (error?.message === "NETWORK_ERROR") {
+        console.error("Gemini network error:", error?.cause?.message || error);
+        throw new Error("GEMINI_NETWORK");
+      }
+      if (
+        error?.message === "GEMINI_MODEL_UNAVAILABLE"
+        || error?.message === "GEMINI_EMPTY_RESPONSE"
+        || error?.message === "GEMINI_REQUEST_FAILED"
+      ) {
+        lastError = error.message;
+        if (i < models.length - 1) continue;
+        throw error;
+      }
+      throw error;
     }
   }
 
-  console.log(`Gemini ${model} finished in ${Date.now() - started}ms, http=${response.status}`);
-
-  if (!response.ok) {
-    const status = Number(response.status);
-    const providerError = data?.error?.message || data?.error || "unknown error";
-    console.error("Gemini request failed with HTTP", status, String(providerError).slice(0, 500));
-    if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
-    if (status === 429) throw new Error("GEMINI_QUOTA");
-    throw new Error("GEMINI_REQUEST_FAILED");
-  }
-
-  const candidate = data?.candidates?.[0];
-  const answer = (candidate?.content?.parts || [])
-    .filter(part => !part?.thought)
-    .map(part => typeof part.text === "string" ? part.text : "")
-    .join("")
-    .trim();
-
-  if (!answer) {
-    if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
-    throw new Error("GEMINI_EMPTY_RESPONSE");
-  }
-  if (candidate?.finishReason === "MAX_TOKENS") {
-    console.warn("Gemini reached the output token limit.");
-  }
-  return answer;
+  throw new Error(lastError);
 }
 
 async function askGrok(text, history, searchContext, timeoutMs) {
@@ -315,15 +395,24 @@ function searchFallback(searchContext) {
 }
 
 function errorForUser(error) {
-  switch (error?.message) {
+  const code = isAbortError(error) ? "AbortError" : error?.message;
+  switch (code) {
     case "MISSING_GEMINI_KEY":
-      return "Сервер пока не настроен. Проверьте переменную GEMINI_API_KEY.";
+      return "Сервер пока не настроен. Проверьте переменную GEMINI_API_KEY в Amvera.";
     case "GEMINI_KEY_REJECTED":
-      return "Не удалось подключиться к Gemini. Проверьте API-ключ.";
+      return "Gemini отклонил API-ключ. Проверьте GEMINI_API_KEY в секретах Amvera.";
     case "GEMINI_QUOTA":
       return "Сейчас превышен лимит запросов к Gemini. Попробуйте немного позже.";
     case "GEMINI_BLOCKED":
       return "Я не смогла обработать этот запрос. Попробуйте спросить иначе.";
+    case "GEMINI_MODEL_UNAVAILABLE":
+      return "Указанная модель Gemini недоступна для ключа. Поставьте GEMINI_MODEL=gemini-3.5-flash-lite.";
+    case "GEMINI_EMPTY_RESPONSE":
+      return "Gemini вернул пустой ответ. Попробуйте короче сформулировать вопрос.";
+    case "GEMINI_REQUEST_FAILED":
+      return "Запрос к Gemini завершился ошибкой. Проверьте логи приложения в Amvera.";
+    case "GEMINI_NETWORK":
+      return "Сервер не достучался до Gemini API. Проверьте интернет/регион Amvera или ключ.";
     case "MISSING_GROK_KEY":
       return "Сервер пока не настроен. Проверьте переменную GROK_API_KEY или XAI_API_KEY.";
     case "GROK_KEY_REJECTED":
@@ -334,12 +423,16 @@ function errorForUser(error) {
     case "GROK_REQUEST_FAILED":
       return "Не получилось получить ответ от Grok. Попробуйте ещё раз чуть позже.";
     case "MISSING_AI_KEY":
-      return "Сервер пока не настроен. Добавьте GEMINI_API_KEY или GROK_API_KEY.";
+      return "Сервер пока не настроен. Добавьте GEMINI_API_KEY в секреты Amvera.";
     case "INVALID_AI_PROVIDER":
       return "В настройках указан неизвестный AI-провайдер. Используйте gemini, grok или auto.";
+    case "INVALID_MODEL_NAME":
+      return "Некорректное имя модели в GEMINI_MODEL.";
     case "TIME_BUDGET_EXHAUSTED":
     case "AbortError":
       return "Не успела подготовить ответ. Попробуйте задать вопрос ещё раз, чуть короче.";
+    case "NETWORK_ERROR":
+      return "Сервер не достучался до нейросети. Проверьте сеть Amvera.";
     default:
       return "Не получилось получить ответ от нейросети. Попробуйте ещё раз чуть позже.";
   }
@@ -350,7 +443,11 @@ export default async function handler(req, res) {
     return res.status(200).json({
       ok: true,
       service: "alice-gemini-serper",
-      message: "Webhook is ready. Yandex Dialogs should send POST requests to /api."
+      message: "Webhook is ready. Yandex Dialogs should send POST requests to /api.",
+      provider: String(process.env.AI_PROVIDER || "auto"),
+      model: String(process.env.GEMINI_MODEL || DEFAULT_MODEL),
+      hasGeminiKey: Boolean(process.env.GEMINI_API_KEY),
+      hasSerperKey: Boolean(process.env.SERPER_API_KEY)
     });
   }
 
@@ -414,10 +511,11 @@ export default async function handler(req, res) {
     console.log(`Alice webhook ok in ${Date.now() - startedAt}ms`);
     return res.status(200).json(aliceResponse(answer, false, history));
   } catch (error) {
-    const safeError = error?.message === "AbortError" ? "TIME_BUDGET_EXHAUSTED" : error;
+    const safeError = isAbortError(error) ? new Error("TIME_BUDGET_EXHAUSTED") : error;
     console.warn(
       `Alice webhook fallback in ${Date.now() - startedAt}ms:`,
-      safeError?.message || "unknown error"
+      safeError?.message || "unknown error",
+      error?.cause?.message || ""
     );
     return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory));
   }
