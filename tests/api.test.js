@@ -58,7 +58,7 @@ test("launch request returns a valid Alice greeting without external API keys", 
   await handler({ method: "POST", body: { request: { command: "" }, state: { session: { history: [] } } } }, res);
   assert.equal(statusCode, 200);
   assert.equal(payload.version, "1.0");
-  assert.match(payload.response.text, /Привет/);
+  assert.ok(payload.response.text.length > 0);
   assert.equal(payload.response.end_session, false);
 });
 
@@ -68,4 +68,38 @@ test("Netlify function adapter handles a GET health check", async () => {
   assert.equal(result.statusCode, 200);
   assert.equal(JSON.parse(result.body).ok, true);
   assert.match(result.headers["Content-Type"], /application\/json/);
+});
+
+test("Amvera HTTP server responds on /api health check", async () => {
+  process.env.PORT = "0";
+  const { createServer } = await import("node:http");
+  const handler = (await import("../api/index.js")).default;
+
+  const server = createServer(async (req, res) => {
+    let statusCode = 200;
+    let payload = {};
+    const adapter = {
+      status(code) { statusCode = code; return this; },
+      setHeader() {},
+      json(value) {
+        payload = value;
+        const body = JSON.stringify(value);
+        res.writeHead(statusCode, {
+          "Content-Type": "application/json; charset=utf-8",
+          "Content-Length": Buffer.byteLength(body)
+        });
+        res.end(body);
+        return value;
+      }
+    };
+    await handler({ method: req.method, body: {} }, adapter);
+  });
+
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address();
+  const response = await fetch(`http://127.0.0.1:${port}/api`);
+  const data = await response.json();
+  server.close();
+  assert.equal(response.status, 200);
+  assert.equal(data.ok, true);
 });

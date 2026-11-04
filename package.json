@@ -3,11 +3,12 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Netlify/Vercel webhook for a Yandex Alice skill powered by Gemini or Grok with optional Serper web search",
+  "description": "Webhook for a Yandex Alice skill powered by Gemini (Amvera / Netlify / Vercel) with optional Serper web search",
   "engines": {
     "node": ">=22"
   },
   "scripts": {
+    "start": "node server.js",
     "test": "node --test"
   }
 }
